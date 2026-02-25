@@ -2,45 +2,12 @@
 
 A fully autonomous drone agent that accepts **natural language commands**, uses a **local LLM** to make flight decisions, and controls a **PX4 drone in Gazebo simulation** via ROS2. A YOLO vision system provides real-time object detection that feeds back into the LLM decision loop.
 
-```
-User text → ROS2 Brain Node → Local LLM (Ollama) → PX4 OFFBOARD commands → Gazebo simulation
-                  ↑
-            YOLO detections (camera feed)
-```
-
 ---
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        ROS2 drone_agent                         │
-│                                                                 │
-│  /user_command ──► Brain Node ◄── /yolo/detections             │
-│  (std_msgs/String)     │               │                        │
-│                         │         YOLO Detector                 │
-│                         │         (/camera topic)               │
-│                         ▼                                       │
-│                    LLM Client                                   │
-│                    (Ollama API)                                  │
-│                         │                                       │
-│                         ▼                                       │
-│                  Command Translator                             │
-│                  (GPS → NED math)                               │
-│                         │                                       │
-│         ┌───────────────┼───────────────┐                      │
-│         ▼               ▼               ▼                      │
-│  /fmu/in/           /fmu/in/       /fmu/in/                    │
-│  offboard_control_  trajectory_    vehicle_                    │
-│  mode               setpoint       command                     │
-└─────────────────────────────────────────────────────────────────┘
-                          │
-                    uXRCE-DDS bridge
-                    (MicroXRCEAgent)
-                          │
-                    PX4 Autopilot
-                    (Gazebo SITL)
-```
+![alt text](<Blank diagram.png>)
+
 
 ### Nodes
 
