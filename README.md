@@ -1,0 +1,486 @@
+# AI-Controlled Drone
+
+A fully autonomous drone agent that accepts **natural language commands**, uses a **local LLM** to make flight decisions, and controls a **PX4 drone in Gazebo simulation** via ROS2. A YOLO vision system provides real-time object detection that feeds back into the LLM decision loop.
+
+```
+User text → ROS2 Brain Node → Local LLM (Ollama) → PX4 OFFBOARD commands → Gazebo simulation
+                  ↑
+            YOLO detections (camera feed)
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        ROS2 drone_agent                         │
+│                                                                 │
+│  /user_command ──► Brain Node ◄── /yolo/detections             │
+│  (std_msgs/String)     │               │                        │
+│                         │         YOLO Detector                 │
+│                         │         (/camera topic)               │
+│                         ▼                                       │
+│                    LLM Client                                   │
+│                    (Ollama API)                                  │
+│                         │                                       │
+│                         ▼                                       │
+│                  Command Translator                             │
+│                  (GPS → NED math)                               │
+│                         │                                       │
+│         ┌───────────────┼───────────────┐                      │
+│         ▼               ▼               ▼                      │
+│  /fmu/in/           /fmu/in/       /fmu/in/                    │
+│  offboard_control_  trajectory_    vehicle_                    │
+│  mode               setpoint       command                     │
+└─────────────────────────────────────────────────────────────────┘
+                          │
+                    uXRCE-DDS bridge
+                    (MicroXRCEAgent)
+                          │
+                    PX4 Autopilot
+                    (Gazebo SITL)
+```
+
+### Nodes
+
+| Node | Description |
+|---|---|
+| `brain_node` | Main orchestrator. Aggregates telemetry, invokes LLM, publishes PX4 setpoints at 10 Hz |
+| `yolo_detector` | Runs YOLOv8 on the Gazebo camera feed, publishes JSON detections |
+| `ros_gz_bridge` | Bridges Gazebo camera images to ROS2 `sensor_msgs/Image` |
+
+### ROS2 Topics
+
+| Topic | Type | Direction |
+|---|---|---|
+| `/user_command` | `std_msgs/String` | **Input** — natural language mission |
+| `/camera` | `sensor_msgs/Image` | From Gazebo via ros_gz_bridge |
+| `/yolo/detections` | `std_msgs/String` | YOLO JSON detections |
+| `/fmu/out/vehicle_odometry` | `px4_msgs/VehicleOdometry` | PX4 → Brain |
+| `/fmu/out/vehicle_gps_position` | `px4_msgs/SensorGps` | PX4 → Brain |
+| `/fmu/out/vehicle_status` | `px4_msgs/VehicleStatus` | PX4 → Brain |
+| `/fmu/out/battery_status` | `px4_msgs/BatteryStatus` | PX4 → Brain |
+| `/fmu/in/offboard_control_mode` | `px4_msgs/OffboardControlMode` | Brain → PX4 |
+| `/fmu/in/trajectory_setpoint` | `px4_msgs/TrajectorySetpoint` | Brain → PX4 |
+| `/fmu/in/vehicle_command` | `px4_msgs/VehicleCommand` | Brain → PX4 |
+
+---
+
+## Prerequisites
+
+### Operating System & ROS
+
+- **Ubuntu 24.04** (Noble)
+- **ROS2 Jazzy** — [installation guide](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)
+
+```bash
+# Verify ROS2 installation
+source /opt/ros/jazzy/setup.bash
+ros2 --version
+```
+
+### PX4-Autopilot
+
+Clone and build PX4 with Gazebo simulation support. This is a separate step from the drone_agent workspace.
+
+```bash
+# Clone PX4 (do this OUTSIDE the drone_agent workspace)
+git clone https://github.com/PX4/PX4-Autopilot.git --recursive
+cd PX4-Autopilot
+
+# Install PX4 dependencies
+bash ./Tools/setup/ubuntu.sh
+
+# Build the Gazebo SITL target (first build takes ~10-15 minutes)
+make px4_sitl gz_x500_mono_cam
+```
+
+> **RAM note:** Gazebo + PX4 SITL needs at least 4 GB of free RAM. If you are RAM-constrained, run with `HEADLESS=1 make px4_sitl gz_x500_mono_cam` to suppress the Gazebo GUI.
+
+### Micro XRCE-DDS Agent
+
+The uXRCE-DDS agent bridges PX4 internal uORB messages to ROS2 DDS topics. PX4 communicates over UDP port 8888.
+
+```bash
+# Install from pip (simplest method)
+pip install micro-xrce-dds-agent
+
+# Or build from source
+git clone https://github.com/eProsima/Micro-XRCE-DDS-Agent.git
+cd Micro-XRCE-DDS-Agent && mkdir build && cd build
+cmake .. && make -j$(nproc)
+sudo make install
+```
+
+### Ollama (Local LLM)
+
+Ollama runs the language model locally. No API keys or internet connection required after the model download.
+
+```bash
+# Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull a model — choose based on your available RAM:
+ollama pull mistral:7b      # Best quality, needs ~5 GB RAM
+ollama pull llama3.2:3b     # Good balance, needs ~2 GB RAM
+ollama pull qwen2.5:3b      # Alternative 3B, needs ~2 GB RAM
+
+# Verify Ollama is running
+ollama list
+```
+
+After pulling, verify the API is accessible:
+
+```bash
+curl http://localhost:11434/api/tags
+# Should return a JSON list of available models
+```
+
+---
+
+## Workspace Setup
+
+### 1. Clone this repository
+
+```bash
+git clone https://github.com/your-username/Ai_controlled_drone.git
+cd Ai_controlled_drone
+```
+
+### 2. Run the setup script
+
+```bash
+bash setup_workspace.sh
+```
+
+This script:
+- Installs ROS2 Jazzy apt packages (`ros_gz_bridge`, `cv_bridge`, etc.)
+- Installs Python packages (`ultralytics`, `opencv-python`)
+- Clones `px4_msgs` into `src/` if not already present
+- Builds the workspace with `colcon`
+
+### 3. Source the workspace
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+```
+
+> Add both lines to your `~/.bashrc` to avoid repeating them in every terminal.
+
+### 4. Configure the LLM
+
+Open [src/drone_agent/drone_agent/llm_client.py](src/drone_agent/drone_agent/llm_client.py) and update the `__init__` defaults to match the model you pulled and your local Ollama URL:
+
+```python
+def __init__(
+    self,
+    model: str = 'mistral:7b',          # change to 'llama3.2:3b' etc. if needed
+    ollama_url: str = 'http://localhost:11434',  # local Ollama endpoint
+):
+```
+
+After editing, rebuild the package:
+
+```bash
+colcon build --symlink-install --packages-select drone_agent
+source install/setup.bash
+```
+
+> If you used `--symlink-install` during the initial build, Python source files are symlinked and the edit is live immediately — no rebuild needed.
+
+---
+
+## Known Setup Issues
+
+### Python environment conflict (Linuxbrew / venv)
+
+If `colcon build` fails with an error about `em.Interpreter` or `empy`, a non-system Python is being picked up. Force the system Python:
+
+```bash
+deactivate  # exit any active venv
+export PATH="/usr/bin:$(echo "$PATH" | tr ':' '\n' | grep -v linuxbrew | tr '\n' ':')"
+rm -rf build/ install/ log/
+colcon build --symlink-install
+```
+
+### NumPy version conflict
+
+`cv_bridge` installed via apt is compiled against NumPy 1.x. If you see a NumPy ABI error:
+
+```bash
+/usr/bin/python3 -m pip install "numpy<2"
+```
+
+### px4_msgs fails to build
+
+Make sure you are not inside any Python virtual environment and that `/usr/bin/python3` is on your `PATH` before any Conda/Linuxbrew Python. See the section above.
+
+---
+
+## Launching the System
+
+The full stack requires **four terminals** running simultaneously.
+
+### Terminal 1 — PX4 SITL + Gazebo
+
+```bash
+cd PX4-Autopilot
+make px4_sitl gz_x500_mono_cam
+```
+
+Wait until you see `[commander] Ready for takeoff!` in the PX4 output before proceeding.
+
+For a headless (no GUI) run to save RAM:
+
+```bash
+HEADLESS=1 make px4_sitl gz_x500_mono_cam
+```
+
+### Terminal 2 — Ollama
+
+If Ollama is not already running as a background service:
+
+```bash
+ollama serve
+```
+
+Ollama listens on `http://localhost:11434` by default. If you want to allow connections from other machines on your network:
+
+```bash
+OLLAMA_HOST=0.0.0.0 ollama serve
+```
+
+### Terminal 3 — uXRCE-DDS Bridge
+
+```bash
+MicroXRCEAgent udp4 -p 8888
+```
+
+This bridges PX4 ↔ ROS2. You should see connection logs once PX4 SITL is running.
+
+### Terminal 4 — Drone Agent (all ROS2 nodes)
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 launch drone_agent drone_agent.launch.py
+```
+
+You should see:
+
+```
+[brain_node]: Brain node started. Waiting for user command on /user_command ...
+[yolo_detector]: YOLO detector node started
+[yolo_detector]: Loading YOLO model: yolov8n.pt
+```
+
+---
+
+## Sending Commands
+
+Open a fifth terminal and publish natural language commands to the `/user_command` topic:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+
+# Take off to 15 metres
+ros2 topic pub /user_command std_msgs/msg/String \
+  "data: 'Take off to 15 metres'" --once
+
+# Circle the area
+ros2 topic pub /user_command std_msgs/msg/String \
+  "data: 'Fly to 40m and circle the area'" --once
+
+# Fly north 100 metres
+ros2 topic pub /user_command std_msgs/msg/String \
+  "data: 'Go north 100 metres at 30m altitude'" --once
+
+# Fly a square pattern
+ros2 topic pub /user_command std_msgs/msg/String \
+  "data: 'Fly a 50 metre square pattern'" --once
+
+# Return to launch and land
+ros2 topic pub /user_command std_msgs/msg/String \
+  "data: 'Return to home and land'" --once
+```
+
+The brain node logs the full pipeline for every command:
+
+```
+============================================================
+>>> LLM INPUT <<<
+User command: Fly to 40m and circle the area
+Drone state:
+GPS: lat=47.397742, lon=8.545594, alt=488.1m MSL, fix=3
+Local position (NED): x=0.1m, y=0.0m, z=-0.3m
+Battery: 100% (12.6V)
+Armed: True
+Nav state: 14
+YOLO detections: []
+Calling Ollama LLM...
+>>> LLM OUTPUT <<<
+LLM response: {'action': 'orbit', 'lat': 47.397742, 'lon': 8.545594, 'alt': 40.0, 'radius': 20.0, 'speed': 5.0}
+>>> COMMAND TRANSLATOR <<<
+Action: orbit | Target NED: x=0.0, y=0.0, z=-10.0 | Orbiting: True | Square: False | Extra PX4 msgs: 0
+============================================================
+```
+
+---
+
+## Available LLM Commands
+
+The LLM is instructed to output one of the following JSON commands. You do not need to use these exact words — the LLM translates your natural language into the appropriate action.
+
+| Action | Parameters | Example phrase |
+|---|---|---|
+| `takeoff` | `alt` (metres) | *"Take off to 20 metres"* |
+| `goto` | `lat`, `lon`, `alt` | *"Fly 200 metres north"* |
+| `orbit` | `lat`, `lon`, `alt`, `radius`, `speed` | *"Circle the area"*, *"Orbit the target"* |
+| `square` | `side` (metres), `alt`, `speed` | *"Fly a square pattern"*, *"Do a box survey"* |
+| `look_at` | `lat`, `lon`, `alt` | *"Look at the person"* |
+| `set_speed` | `speed` (m/s) | *"Slow down to 3 m/s"* |
+| `set_heading` | `heading` (0–360°) | *"Face north"* |
+| `land` | — | *"Land now"* |
+| `rtl` | — | *"Return to home"*, *"Come back"* |
+| `hold` | — | *"Hover here"*, *"Stop"* |
+
+### LLM Rules (from system prompt)
+
+- Altitude is constrained between **5 m and 120 m**
+- Default orbit radius is **20 m**; default speed is **5 m/s**
+- If YOLO detects a person and the user requests tracking, the drone orbits around the current position
+- Relative directions (north, east, south, west) are offset from the current GPS position
+  - 1° latitude ≈ 111,000 m
+  - 1° longitude ≈ 111,000 × cos(lat) m
+
+---
+
+## Configuration
+
+Edit [src/drone_agent/config/params.yaml](src/drone_agent/config/params.yaml) to tune behaviour:
+
+```yaml
+brain_node:
+  ros__parameters:
+    llm_interval_sec: 7.0       # Periodic LLM re-evaluation interval (currently disabled)
+    offboard_rate_hz: 10.0      # PX4 OFFBOARD heartbeat rate — do not lower below 2 Hz
+
+yolo_detector:
+  ros__parameters:
+    model_path: "yolov8n.pt"    # YOLO model: yolov8n / yolov8s / yolov8m etc.
+    confidence_threshold: 0.5   # Detections below this are ignored
+    camera_topic: "/camera"     # ROS2 topic from ros_gz_bridge
+    skip_frames: 2              # Process every Nth frame (1 = every frame)
+```
+
+### Choosing a YOLO model
+
+| Model | Speed | Accuracy | Use case |
+|---|---|---|---|
+| `yolov8n.pt` | Fastest | Lowest | Low-power laptops, quick demos |
+| `yolov8s.pt` | Fast | Medium | Recommended general use |
+| `yolov8m.pt` | Moderate | High | GPU available |
+
+The model downloads automatically from Ultralytics on first run.
+
+### Choosing an Ollama model
+
+| Model | RAM needed | Response quality |
+|---|---|---|
+| `llama3.2:3b` | ~2 GB | Good for simple commands |
+| `qwen2.5:3b` | ~2 GB | Good JSON discipline |
+| `mistral:7b` | ~5 GB | Best command comprehension |
+| `llama3.1:8b` | ~6 GB | High accuracy |
+
+---
+
+## Project Structure
+
+```
+Ai_controlled_drone/
+├── setup_workspace.sh                         # One-shot setup script
+└── src/
+    ├── px4_msgs/                              # PX4 ROS2 message definitions (cloned by setup)
+    └── drone_agent/
+        ├── package.xml                        # ROS2 package manifest
+        ├── setup.py                           # Python entry points
+        ├── config/
+        │   └── params.yaml                    # Node parameters
+        ├── launch/
+        │   └── drone_agent.launch.py          # Launches all three nodes
+        └── drone_agent/
+            ├── brain_node.py                  # Main orchestrator
+            ├── yolo_detector.py               # YOLOv8 detection node
+            ├── llm_client.py                  # Ollama API client
+            └── command_translator.py          # LLM JSON → PX4 messages
+```
+
+---
+
+## How It Works (Data Flow)
+
+1. **User sends a natural language command** to `/user_command` (e.g. `"Circle the area at 40m"`).
+2. **Brain node** receives the command and immediately calls the LLM.
+3. **LLM client** packages the current telemetry (GPS, NED position, velocity, battery, armed state) and the latest YOLO detections into a structured prompt, then sends it to Ollama.
+4. **Ollama** returns a single JSON command (e.g. `{"action": "orbit", "lat": ..., "alt": 40.0, "radius": 20.0}`).
+5. **Command translator** converts the JSON into PX4 messages:
+   - `takeoff` → arms the drone, switches to OFFBOARD mode, sets NED z-target
+   - `goto` → converts GPS lat/lon to local NED and sets trajectory setpoint
+   - `orbit` → continuously updates the trajectory setpoint in a circle at 10 Hz
+   - `square` → sets four NED corner waypoints, advances to the next when within 1 m
+   - `land` / `rtl` → sends the appropriate MAVLink vehicle command
+6. **Brain node's 10 Hz offboard loop** continuously publishes `OffboardControlMode` and `TrajectorySetpoint` to keep PX4 in OFFBOARD mode.
+7. **YOLO detector** watches the Gazebo camera; if the set of detected object classes changes while a mission is active, it triggers a new LLM call automatically.
+
+---
+
+## Dependencies Summary
+
+| Dependency | Install method |
+|---|---|
+| Ubuntu 24.04 | OS |
+| ROS2 Jazzy | apt |
+| ros-jazzy-ros-gz-bridge | apt |
+| ros-jazzy-cv-bridge | apt |
+| python3-colcon-common-extensions | apt |
+| ultralytics (YOLOv8) | pip |
+| opencv-python | pip |
+| px4_msgs | git clone (done by setup script) |
+| PX4-Autopilot | git clone (separate, see above) |
+| MicroXRCEAgent | pip or build from source |
+| Ollama | install script |
+
+---
+
+## Troubleshooting
+
+**Brain node logs "LLM API call failed"**
+- Check Ollama is running: `curl http://localhost:11434/api/tags`
+- Verify the model name in `llm_client.py` matches a pulled model: `ollama list`
+- Check the `ollama_url` in `llm_client.py` is `http://localhost:11434`
+
+**PX4 does not arm / OFFBOARD mode rejected**
+- The OFFBOARD heartbeat (10 Hz) must be publishing before PX4 will accept the mode switch. The brain node starts publishing immediately — if you see this, ensure MicroXRCEAgent is running and connected.
+- Check uXRCE-DDS bridge is showing incoming topic messages.
+
+**YOLO node crashes with NumPy error**
+- Run: `sudo /usr/bin/python3 -m pip install "numpy<2"`
+
+**colcon build fails with `em.Interpreter` error**
+- You are using a non-system Python. Run `deactivate`, strip Linuxbrew/Conda from PATH, then rebuild. See the Known Setup Issues section above.
+
+**Gazebo crashes / runs out of memory**
+- Use headless mode: `HEADLESS=1 make px4_sitl gz_x500_mono_cam`
+- Or add 4–8 GB of swap: `sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`
+
+**LLM responds slowly**
+- 7B models take 5–15 seconds per inference on CPU. Use a 3B model for faster response on lower-end hardware.
+- The brain node rate-limits LLM calls to one per 3 seconds regardless.
+
+---
+
+## License
+
+MIT

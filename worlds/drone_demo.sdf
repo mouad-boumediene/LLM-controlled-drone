@@ -1,0 +1,182 @@
+<?xml version="1.0" ?>
+<!--
+  Gazebo (gz-sim / Harmonic) world for the AI drone demo.
+
+  Contains:
+    - A walking human actor   → YOLO class "person"
+    - A Prius Hybrid car      → YOLO class "car"
+
+  Placed roughly 20 m north (actor) and 25 m east (car) of the spawn origin
+  so a default 20 m-radius orbit centred on x=0,y=0 will sweep past both.
+
+  ── HOW TO USE ──────────────────────────────────────────────────────────────
+  Option A: symlink into PX4's worlds folder (recommended)
+    ln -s $(pwd)/worlds/drone_demo.sdf \
+          ~/PX4-Autopilot/Tools/simulation/gz/worlds/drone_demo.sdf
+
+  Option B: copy it there
+    cp worlds/drone_demo.sdf ~/PX4-Autopilot/Tools/simulation/gz/worlds/
+
+  Then launch PX4 SITL with:
+    cd ~/PX4-Autopilot
+    PX4_GZ_WORLD=drone_demo make px4_sitl gz_x500_mono_cam
+
+  ── MODEL NOTES ─────────────────────────────────────────────────────────────
+  Models are fetched from Gazebo Fuel on first launch (requires internet).
+  If Fuel is unavailable, swap the <include> blocks for local model:// URIs.
+
+  YOLO detection in simulation:
+    YOLOv8n is trained on real images (COCO).  Textured 3-D Fuel models are
+    detected reasonably well.  If detections are unreliable, try increasing
+    orbit radius (wider camera sweep) or switching to yolov8s/yolov8m.
+  ────────────────────────────────────────────────────────────────────────────
+-->
+<sdf version="1.9">
+  <world name="drone_demo">
+
+    <!-- ── Physics ─────────────────────────────────────────────────────── -->
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- ── GPS origin (REQUIRED for PX4 NavSat / magnetometer) ────────────
+         Use the same coordinates as the standard PX4 default world so that
+         QGC maps and home-position logic work identically.
+         Without this element: GPS sensor returns no fix and the magnetometer
+         cannot compute the expected field vector → "strong magnetic interference"
+         and "No valid position estimate" errors in QGC.
+    ──────────────────────────────────────────────────────────────────────── -->
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <world_frame_orientation>ENU</world_frame_orientation>
+      <latitude_deg>47.397971057728974</latitude_deg>
+      <longitude_deg>8.546163739800146</longitude_deg>
+      <elevation>488.0</elevation>
+      <heading_deg>0</heading_deg>
+    </spherical_coordinates>
+
+    <!-- ── Required gz-sim plugins ─────────────────────────────────────── -->
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-imu-system"
+            name="gz::sim::systems::Imu"/>
+    <plugin filename="gz-sim-magnetometer-system"
+            name="gz::sim::systems::Magnetometer"/>
+    <plugin filename="gz-sim-air-pressure-system"
+            name="gz::sim::systems::AirPressure"/>
+    <!-- NavSat (GPS) — CRITICAL: without this the drone has no position fix -->
+    <plugin filename="gz-sim-navsat-system"
+            name="gz::sim::systems::NavSat"/>
+    <plugin filename="gz-sim-wind-system"
+            name="gz::sim::systems::Wind"/>
+
+    <!-- ── Lighting ─────────────────────────────────────────────────────── -->
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- ── Ground plane ─────────────────────────────────────────────────── -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>500 500</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>500 500</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.35 0.45 0.25 1</ambient>
+            <diffuse>0.35 0.45 0.25 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ── Person (walking actor) ───────────────────────────────────────────
+         Placed 20 m north of origin (x=20, y=0 in Gazebo ENU = NED x=20,y=0).
+         The walk.dae mesh is a standard Gazebo Fuel actor with humanoid geometry.
+         YOLO class: "person"
+    ──────────────────────────────────────────────────────────────────────── -->
+    <actor name="person_1">
+      <pose>0 20 0 0 0 0</pose>
+      <!-- Gazebo ENU: x=East, y=North → person at y=20 → NED x=20 (20 m north) -->
+      <skin>
+        <filename>https://fuel.gazebosim.org/1.0/Mingfei/models/actor/tip/files/meshes/walk.dae</filename>
+        <scale>1.0</scale>
+      </skin>
+      <animation name="walk">
+        <filename>https://fuel.gazebosim.org/1.0/Mingfei/models/actor/tip/files/meshes/walk.dae</filename>
+        <interpolate_x>true</interpolate_x>
+      </animation>
+      <!-- Slow idle walk-in-place so YOLO sees a dynamic humanoid silhouette -->
+      <script>
+        <loop>true</loop>
+        <delay_start>0</delay_start>
+        <auto_start>true</auto_start>
+        <trajectory id="0" type="walk">
+          <waypoint>
+            <time>0</time>
+            <pose>0 20 0 0 0 1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>4</time>
+            <pose>2 20 0 0 0 1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>8</time>
+            <pose>0 20 0 0 0 -1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>12</time>
+            <pose>-2 20 0 0 0 -1.5708</pose>
+          </waypoint>
+          <waypoint>
+            <time>16</time>
+            <pose>0 20 0 0 0 1.5708</pose>
+          </waypoint>
+        </trajectory>
+      </script>
+    </actor>
+
+    <!-- ── Car (Prius Hybrid from Gazebo Fuel) ──────────────────────────────
+         Placed 25 m east of origin (x=0, y=25 in Gazebo ENU = NED x=0,y=25).
+         YOLO class: "car"
+    ──────────────────────────────────────────────────────────────────────── -->
+    <include>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Prius Hybrid</uri>
+      <name>car_1</name>
+      <!-- Gazebo ENU pose: x=25 (east), y=0 (north) → NED y=25 (25 m east) -->
+      <pose>25 0 0 0 0 0</pose>
+    </include>
+
+  </world>
+</sdf>

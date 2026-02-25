@@ -1,0 +1,35 @@
+# ── Scratch / test files ────────────────────────────────────────────────────
+LLM_respond.txt
+
+# ── Credentials / secrets ──────────────────────────────────────────────────
+geminiAPIkEY.txt
+*.key
+*.pem
+.env
+.env.*
+
+# ── Local config (may contain private server URLs) ──────────────────────────
+src/drone_agent/config/params.yaml
+
+# ── Build artifacts ─────────────────────────────────────────────────────────
+build/
+install/
+log/
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# ── YOLO / ML models (large binaries — download separately) ─────────────────
+*.pt
+*.onnx
+*.torchscript
+
+# ── ROS2 / Colcon ───────────────────────────────────────────────────────────
+.colcon_install_layout
+
+# ── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
