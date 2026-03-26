@@ -31,11 +31,19 @@ PX4_CUSTOM_MAIN_MODE_OFFBOARD = 6.0
 class CommandTranslator:
     """Translates LLM JSON commands to PX4 ROS2 messages."""
 
-    def __init__(self, home_lat: float = 0.0, home_lon: float = 0.0, home_alt: float = 0.0):
+    def __init__(
+        self,
+        home_lat: float = 0.0,
+        home_lon: float = 0.0,
+        home_alt: float = 0.0,
+        max_speed_m_s: float = 0.0,
+    ):
         self.home_lat = home_lat
         self.home_lon = home_lon
         self.home_alt = home_alt
         self.home_set = False
+        self.max_speed_m_s = max(0.0, float(max_speed_m_s))
+        self.translation_speed_cap_override_m_s = 0.0
 
         # Current target setpoint (updated by commands)
         self.target_x = 0.0  # North (meters, NED)
@@ -61,8 +69,24 @@ class CommandTranslator:
         self.square_speed = 2.0
         self.square_threshold = 1.0  # meters — how close before moving to next wp
 
+        # Latest measured vehicle position from odometry (used for speed limiting)
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.current_z = 0.0
+        self.have_position = False
+        self._last_tick_time = None
+        self._last_setpoint_x = self.target_x
+        self._last_setpoint_y = self.target_y
+        self._last_setpoint_z = self.target_z
+        self._have_last_setpoint = False
+
     def update_position(self, x: float, y: float, z: float):
         """Update the drone's current local position (NED) for waypoint tracking."""
+        self.current_x = float(x)
+        self.current_y = float(y)
+        self.current_z = float(z)
+        self.have_position = True
+
         if self.square_active and self.square_waypoints:
             wp = self.square_waypoints[self.square_wp_index]
             dist = math.sqrt((x - wp[0]) ** 2 + (y - wp[1]) ** 2)
@@ -143,7 +167,7 @@ class CommandTranslator:
         # ── Circular orbit ───────────────────────────────────────────────
         elif action == 'orbit':
             self.orbit_radius = float(cmd.get('radius', 20.0))
-            self.orbit_speed = float(cmd.get('speed', 5.0))
+            self.orbit_speed = self._cap_speed(cmd.get('speed', 5.0))
             self.orbit_angle = 0.0
             self.square_active = False
 
@@ -167,7 +191,7 @@ class CommandTranslator:
         # ── Square / rectangular survey ──────────────────────────────────
         elif action in ('square_survey', 'square'):
             side = float(cmd.get('side', 10.0))
-            speed = float(cmd.get('speed', 2.0))
+            speed = self._cap_speed(cmd.get('speed', 2.0))
             # alt_z (new style, already negative) or alt (legacy, positive)
             if 'alt_z' in cmd:
                 alt_z = float(cmd['alt_z'])
@@ -206,7 +230,7 @@ class CommandTranslator:
 
         # ── Speed / heading ──────────────────────────────────────────────
         elif action == 'set_speed':
-            self.target_speed = float(cmd.get('speed', 5.0))
+            self.target_speed = self._cap_speed(cmd.get('speed', 5.0))
             self.orbit_speed = self.target_speed
 
         elif action == 'set_heading':
@@ -235,51 +259,107 @@ class CommandTranslator:
         return messages
 
     def get_setpoint_tick(self) -> TrajectorySetpoint:
-        """Generate the current TrajectorySetpoint for the 10Hz publish loop.
+        """Generate the current TrajectorySetpoint for the offboard publish loop.
 
         If orbiting, advances the orbit angle. Otherwise returns the
         current static target position.
         """
         msg = TrajectorySetpoint()
         msg.timestamp = int(time.time() * 1e6)
+        now = time.monotonic()
+        if self._last_tick_time is None:
+            dt = 0.0
+        else:
+            dt = max(0.0, now - self._last_tick_time)
+        self._last_tick_time = now
+
+        target_x = self.target_x
+        target_y = self.target_y
+        target_z = self.target_z
+        target_yaw = self.target_yaw
 
         if self.square_active:
-            # Check if we reached the current waypoint
             wp = self.square_waypoints[self.square_wp_index]
-            dist = math.sqrt(
-                (self.target_x - wp[0]) ** 2 + (self.target_y - wp[1]) ** 2
-            )
-            # target is already set to current wp, check if drone is near it
-            # (We approximate by checking if setpoint hasn't changed recently)
-            # Advance to next waypoint each tick cycle based on position feedback
-            msg.position[0] = wp[0]
-            msg.position[1] = wp[1]
-            msg.position[2] = self.square_alt_z
-            msg.yaw = float('nan')
-            return msg
+            target_x = wp[0]
+            target_y = wp[1]
+            target_z = self.square_alt_z
+            target_yaw = float('nan')
 
         elif self.orbiting:
-            # Advance orbit angle based on speed and radius
-            # angular_velocity = linear_speed / radius
-            dt = 0.1  # 10Hz tick
             angular_vel = self.orbit_speed / max(self.orbit_radius, 1.0)
             self.orbit_angle += angular_vel * dt
 
-            msg.position[0] = self.orbit_center_x + self.orbit_radius * math.cos(self.orbit_angle)
-            msg.position[1] = self.orbit_center_y + self.orbit_radius * math.sin(self.orbit_angle)
-            msg.position[2] = self.orbit_alt_z
+            target_x = self.orbit_center_x + self.orbit_radius * math.cos(self.orbit_angle)
+            target_y = self.orbit_center_y + self.orbit_radius * math.sin(self.orbit_angle)
+            target_z = self.orbit_alt_z
 
             # Point yaw toward orbit center
-            dx = self.orbit_center_x - msg.position[0]
-            dy = self.orbit_center_y - msg.position[1]
-            msg.yaw = math.atan2(dy, dx)
-        else:
-            msg.position[0] = self.target_x
-            msg.position[1] = self.target_y
-            msg.position[2] = self.target_z
-            msg.yaw = self.target_yaw
+            dx = self.orbit_center_x - target_x
+            dy = self.orbit_center_y - target_y
+            target_yaw = math.atan2(dy, dx)
+
+        target_x, target_y, target_z = self._limit_translation_speed(
+            target_x, target_y, target_z, dt
+        )
+        msg.position[0] = target_x
+        msg.position[1] = target_y
+        msg.position[2] = target_z
+        msg.yaw = target_yaw
+        self._last_setpoint_x = target_x
+        self._last_setpoint_y = target_y
+        self._last_setpoint_z = target_z
+        self._have_last_setpoint = True
 
         return msg
+
+    def _cap_speed(self, speed: float) -> float:
+        """Clamp requested mission speed to the configured hard cap."""
+        speed = max(0.0, float(speed))
+        if self.max_speed_m_s > 0.0:
+            return min(speed, self.max_speed_m_s)
+        return speed
+
+    def _limit_translation_speed(
+        self,
+        target_x: float,
+        target_y: float,
+        target_z: float,
+        dt: float,
+    ) -> tuple[float, float, float]:
+        """Limit horizontal setpoint motion so the setpoint itself never jumps faster than the cap.
+
+        Altitude is left unconstrained here so takeoff and climb commands can
+        present a meaningful vertical target to PX4 immediately.
+        """
+        speed_cap = self.translation_speed_cap_override_m_s
+        if speed_cap <= 0.0:
+            speed_cap = self.max_speed_m_s
+
+        if speed_cap <= 0.0 or dt <= 0.0:
+            return target_x, target_y, target_z
+
+        if self._have_last_setpoint:
+            base_x = self._last_setpoint_x
+            base_y = self._last_setpoint_y
+        elif self.have_position:
+            base_x = self.current_x
+            base_y = self.current_y
+        else:
+            return target_x, target_y, target_z
+
+        max_step = speed_cap * dt
+        dx = target_x - base_x
+        dy = target_y - base_y
+        dist_xy = math.hypot(dx, dy)
+        if dist_xy <= max_step or dist_xy == 0.0:
+            return target_x, target_y, target_z
+
+        scale = max_step / dist_xy
+        return (
+            base_x + dx * scale,
+            base_y + dy * scale,
+            target_z,
+        )
 
     def get_offboard_control_mode(self) -> OffboardControlMode:
         """Generate an OffboardControlMode message (position control)."""

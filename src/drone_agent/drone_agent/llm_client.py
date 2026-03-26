@@ -85,6 +85,7 @@ DECISION RULES
 - For takeoff: if not armed → arm_offboard. If armed → position_ned with z = -altitude.
 - Relative movement: "go 100m north" → new_x = current_x + 100, keep y and z.
 - Relative movement: "go 50m east"  → new_y = current_y + 50,  keep x and z.
+- If the user does not explicitly ask to change altitude, preserve the current altitude.
 - GPS target: apply GPS→NED formula, then output position_ned.
 - "Search / scan / look around / survey" (no specific object) → orbit, no target_class.
 - "Find / look for / search for <object>" → orbit with target_class = YOLO class name.
@@ -106,6 +107,75 @@ OUTPUT FORMAT — always this exact shape, no markdown:
 }
 """
 
+MISSION_PLANNER_PROMPT = """Convert a sequenced drone mission into a list of explicit step prompts.
+
+Return JSON only in this exact shape:
+
+{
+  "steps":[
+    {
+      "command":"set altitude to 20 meters",
+      "completion":{"type":"altitude_reached","target_m":20.0,"tolerance_m":0.8}
+    },
+    {
+      "command":"fly in a rectangle",
+      "completion":{"type":"duration","seconds":60}
+    },
+    {
+      "command":"takeoff",
+      "completion":{"type":"airborne","min_altitude_m":0.8}
+    },
+    {
+      "command":"face east",
+      "completion":{"type":"heading_reached","tolerance_deg":8.0}
+    },
+    {
+      "command":"fly forward 10 meters",
+      "completion":{"type":"position_reached","tolerance_m":1.0}
+    },
+    {
+      "command":"search for the bus",
+      "completion":{"type":"target_found","target_class":"bus"}
+    },
+    {
+      "command":"approach the bus",
+      "completion":{"type":"approach_complete","target_class":"bus"}
+    }
+  ]
+}
+
+Rules:
+- Always return a non-empty "steps" list.
+- Each step's "command" must be a short standalone prompt that the normal controller can execute by itself.
+- Resolve references like "it", "them", and "that one" into explicit command text and explicit target_class values.
+- Supported completion types:
+  - duration
+  - altitude_reached
+  - airborne
+  - heading_reached
+  - position_reached
+  - target_found
+  - approach_complete
+- For heading-only steps like "face east" or "set heading to 90 degrees", use "heading_reached", not duration 0.
+- For one-shot movement steps like "fly forward 10 meters" or "go 20 meters north", use "position_reached", not duration 0.
+- target_class must be one of: person, car, truck, bus, bicycle, motorcycle, dog, cat, boat, airplane.
+- Use "takeoff" only when the user explicitly wants takeoff as a separate step. If the next step already sets altitude, you may still keep "takeoff" as its own step with completion type "airborne".
+- Do not include explanations or markdown.
+
+Example:
+Input: "takeoff, then set the altitude to 2 meters, then fly in a square for 1 minute then hold for 10 seconds, then fly in a circle for 1 minute"
+Output:
+{
+  "steps":[
+    {"command":"takeoff","completion":{"type":"airborne","min_altitude_m":0.8}},
+    {"command":"set altitude to 2 meters","completion":{"type":"altitude_reached","target_m":2.0,"tolerance_m":0.5}},
+    {"command":"fly in a square","completion":{"type":"duration","seconds":60}},
+    {"command":"hold for 10 seconds","completion":{"type":"duration","seconds":10}},
+    {"command":"fly in a circle","completion":{"type":"duration","seconds":60}}
+  ]
+}
+"""
+
 
 class LLMClient:
     """LLM client using Ollama local API with rolling conversation memory."""
@@ -115,16 +185,22 @@ class LLMClient:
         model: str = 'qwen2.5:32b',
         ollama_url: str = 'http://localhost:11434',
         max_history_turns: int = 10,
+        request_timeout_sec: float = 60.0,
+        planner_timeout_sec: float = 45.0,
     ):
         self.model = model
         self.ollama_url = ollama_url.rstrip('/')
         self.max_history_turns = max_history_turns
+        self.request_timeout_sec = float(request_timeout_sec)
+        self.planner_timeout_sec = float(planner_timeout_sec)
         # Rolling conversation history: list of {'role': ..., 'content': ...} dicts.
         # Does NOT include the system prompt (that is always prepended separately).
         self.history: list = []
         logger.info(
             f'Using Ollama model: {self.model} at {self.ollama_url} '
-            f'(memory: {self.max_history_turns} turns)'
+            f'(memory: {self.max_history_turns} turns, '
+            f'command timeout: {self.request_timeout_sec:.0f}s, '
+            f'planner timeout: {self.planner_timeout_sec:.0f}s)'
         )
 
     def reset_memory(self):
@@ -132,7 +208,14 @@ class LLMClient:
         self.history = []
         logger.info('LLM memory cleared.')
 
-    def ask(self, drone_state: str, user_command: str, yolo_detections: str) -> dict:
+    def ask(
+        self,
+        drone_state: str,
+        user_command: str,
+        yolo_detections: str,
+        *,
+        include_history: bool = True,
+    ) -> dict:
         """Send telemetry + command to Ollama and return parsed JSON command.
 
         The full conversation history is included in every request so the LLM
@@ -156,9 +239,11 @@ class LLMClient:
             "Respond with ONLY a JSON command."
         )
 
+        history = self.history if include_history else []
+
         messages = [
             {'role': 'system', 'content': SYSTEM_PROMPT},
-            *self.history,
+            *history,
             {'role': 'user', 'content': user_content},
         ]
 
@@ -182,7 +267,7 @@ class LLMClient:
                     'ngrok-skip-browser-warning': 'true',
                 },
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=self.request_timeout_sec) as resp:
                 result = json.loads(resp.read().decode('utf-8'))
 
             text = result['message']['content'].strip()
@@ -193,18 +278,20 @@ class LLMClient:
             if 'action' not in command:
                 raise ValueError(f"LLM response missing 'action' key: {command}")
 
-            # Store user turn and assistant response in history
-            self.history.append({'role': 'user', 'content': user_content})
-            self.history.append({'role': 'assistant', 'content': text})
+            if include_history:
+                # Store user turn and assistant response in history
+                self.history.append({'role': 'user', 'content': user_content})
+                self.history.append({'role': 'assistant', 'content': text})
 
-            # Trim history to max_history_turns (each turn = 1 user + 1 assistant msg)
-            max_msgs = self.max_history_turns * 2
-            if len(self.history) > max_msgs:
-                self.history = self.history[-max_msgs:]
+                # Trim history to max_history_turns (each turn = 1 user + 1 assistant msg)
+                max_msgs = self.max_history_turns * 2
+                if len(self.history) > max_msgs:
+                    self.history = self.history[-max_msgs:]
 
             logger.info(
                 f'LLM command: {command}  '
-                f'[memory: {len(self.history) // 2}/{self.max_history_turns} turns]'
+                f'[memory: {len(self.history) // 2}/{self.max_history_turns} turns'
+                f'{"; no history used" if not include_history else ""}]'
             )
             return command
 
@@ -213,4 +300,51 @@ class LLMClient:
             raise ValueError(f'LLM returned invalid JSON: {e}') from e
         except Exception as e:
             logger.error(f'LLM API call failed: {e}')
+            raise
+
+    def plan_mission(self, user_command: str) -> dict:
+        """Return a structured list of step prompts for a sequenced mission."""
+        messages = [
+            {'role': 'system', 'content': MISSION_PLANNER_PROMPT},
+            {'role': 'user', 'content': user_command},
+        ]
+
+        payload = json.dumps({
+            'model': self.model,
+            'messages': messages,
+            'stream': False,
+            'options': {
+                'temperature': 0.0,
+            },
+            'format': 'json',
+        }).encode('utf-8')
+
+        text = ''
+        try:
+            req = urllib.request.Request(
+                f'{self.ollama_url}/api/chat',
+                data=payload,
+                headers={
+                    'Content-Type': 'application/json',
+                    'ngrok-skip-browser-warning': 'true',
+                },
+            )
+            with urllib.request.urlopen(req, timeout=self.planner_timeout_sec) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+
+            text = result['message']['content'].strip()
+            text = text.replace('```json', '').replace('```', '').strip()
+            plan = json.loads(text)
+
+            if not isinstance(plan.get('steps'), list) or len(plan['steps']) == 0:
+                raise ValueError(f"Planner response missing non-empty 'steps': {plan}")
+
+            logger.info(f'LLM mission planner output: {plan}')
+            return plan
+
+        except json.JSONDecodeError as e:
+            logger.error(f'Failed to parse planner response as JSON: {text!r}')
+            raise ValueError(f'Planner returned invalid JSON: {e}') from e
+        except Exception as e:
+            logger.error(f'Planner API call failed: {e}')
             raise

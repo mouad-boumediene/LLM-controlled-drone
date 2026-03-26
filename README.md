@@ -246,7 +246,7 @@ You should see:
 ```
 [brain_node]: Brain node started. Waiting for user command on /user_command ...
 [yolo_detector]: YOLO detector node started
-[yolo_detector]: Loading YOLO model: yolov8n.pt
+[yolo_detector]: Loading YOLO model: yolov8s.pt
 ```
 
 ---
@@ -342,7 +342,7 @@ brain_node:
 
 yolo_detector:
   ros__parameters:
-    model_path: "yolov8n.pt"    # YOLO model: yolov8n / yolov8s / yolov8m etc.
+    model_path: "yolov8s.pt"    # YOLO model: yolov8s / yolov8m etc.
     confidence_threshold: 0.5   # Detections below this are ignored
     camera_topic: "/camera"     # ROS2 topic from ros_gz_bridge
     skip_frames: 2              # Process every Nth frame (1 = every frame)

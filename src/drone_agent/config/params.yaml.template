@@ -1,13 +1,14 @@
 brain_node:
   ros__parameters:
     llm_interval_sec: 7.0
-    offboard_rate_hz: 10.0
+    offboard_rate_hz: 30.0
+    max_speed_m_s: 2.0
     ollama_url: "http://localhost:11434"   # change to your Ollama server URL
-    ollama_model: "qwen2.5:32b"           # or qwen2.5:7b, llama3.2, etc.
+    ollama_model: "qwen3:4b"             # small laptop-friendly default
 
 yolo_detector:
   ros__parameters:
-    model_path: "yolov8n.pt"
+    model_path: "yolov8s.pt"
     confidence_threshold: 0.5
-    camera_topic: "/camera"
+    camera_topic: "/x500/camera/image_raw"
     skip_frames: 2
