@@ -14,6 +14,8 @@ from px4_msgs.msg import (
     VehicleCommand,
 )
 
+from drone_agent.shape_generator import generate_shape_waypoints
+
 
 # PX4 MAV_CMD constants
 MAV_CMD_NAV_TAKEOFF = 22
@@ -69,6 +71,16 @@ class CommandTranslator:
         self.square_speed = 2.0
         self.square_threshold = 1.0  # meters — how close before moving to next wp
 
+        # Generic waypoint path state
+        self.path_active = False
+        self.path_waypoints = []  # List of (x, y, z) NED waypoints
+        self.path_wp_index = 0
+        self.path_speed = 2.0
+        self.path_threshold = 1.0  # meters — how close before advancing
+        self.path_loop = False
+        self.path_sequence_id = 0
+        self.path_completed_sequence_id = 0
+
         # Latest measured vehicle position from odometry (used for speed limiting)
         self.current_x = 0.0
         self.current_y = 0.0
@@ -95,6 +107,33 @@ class CommandTranslator:
                 wp = self.square_waypoints[self.square_wp_index]
                 self.target_x = wp[0]
                 self.target_y = wp[1]
+
+        if self.path_active and self.path_waypoints:
+            wp = self.path_waypoints[self.path_wp_index]
+            dist = math.sqrt(
+                (x - wp[0]) ** 2 +
+                (y - wp[1]) ** 2 +
+                (z - wp[2]) ** 2
+            )
+            if dist < self.path_threshold:
+                if self.path_wp_index + 1 < len(self.path_waypoints):
+                    self.path_wp_index += 1
+                    wp = self.path_waypoints[self.path_wp_index]
+                    self.target_x = wp[0]
+                    self.target_y = wp[1]
+                    self.target_z = wp[2]
+                elif self.path_loop and len(self.path_waypoints) > 1:
+                    self.path_wp_index = 0
+                    wp = self.path_waypoints[self.path_wp_index]
+                    self.target_x = wp[0]
+                    self.target_y = wp[1]
+                    self.target_z = wp[2]
+                else:
+                    self.path_active = False
+                    self.path_completed_sequence_id = self.path_sequence_id
+                    self.target_x = wp[0]
+                    self.target_y = wp[1]
+                    self.target_z = wp[2]
 
     def set_home(self, lat: float, lon: float, alt: float):
         """Set the home/reference position for GPS-to-local conversions."""
@@ -138,6 +177,7 @@ class CommandTranslator:
             # takeoff kept as alias: arm, switch mode, set target altitude
             self.orbiting = False
             self.square_active = False
+            self.path_active = False
             if action == 'takeoff':
                 self.target_z = -abs(cmd.get('alt', 10.0))
             messages.extend(self._arm_and_offboard())
@@ -151,6 +191,7 @@ class CommandTranslator:
             self.target_yaw = float(yaw) if yaw is not None else float('nan')
             self.orbiting = False
             self.square_active = False
+            self.path_active = False
 
         # ── GPS-based goto (legacy alias) ────────────────────────────────
         elif action == 'goto':
@@ -163,6 +204,7 @@ class CommandTranslator:
             self.target_z = d
             self.orbiting = False
             self.square_active = False
+            self.path_active = False
 
         # ── Circular orbit ───────────────────────────────────────────────
         elif action == 'orbit':
@@ -170,6 +212,7 @@ class CommandTranslator:
             self.orbit_speed = self._cap_speed(cmd.get('speed', 5.0))
             self.orbit_angle = 0.0
             self.square_active = False
+            self.path_active = False
 
             if 'cx' in cmd:
                 # New style: LLM computed NED centre directly
@@ -211,9 +254,53 @@ class CommandTranslator:
             self.square_speed = speed
             self.square_active = True
             self.orbiting = False
+            self.path_active = False
             self.target_x = self.square_waypoints[0][0]
             self.target_y = self.square_waypoints[0][1]
             self.target_z = self.square_alt_z
+
+        # ── Generic waypoint path ───────────────────────────────────────
+        elif action == 'path':
+            points_raw = cmd.get('points')
+            if not isinstance(points_raw, list) or len(points_raw) < 2:
+                raise ValueError('path action requires at least two waypoints')
+
+            default_z = self.target_z
+            waypoints = [self._normalize_path_point(point, default_z) for point in points_raw]
+            closed = bool(cmd.get('closed', False))
+            if closed and self._path_points_differ(waypoints[0], waypoints[-1]):
+                waypoints.append(waypoints[0])
+
+            self._activate_path(
+                waypoints,
+                speed=cmd.get('speed', self.target_speed),
+                threshold_m=cmd.get('threshold_m'),
+                loop=cmd.get('loop', False),
+            )
+
+        # ── Deterministic named shape path ──────────────────────────────
+        elif action == 'shape_path':
+            if self.have_position:
+                origin_x = self.current_x
+                origin_y = self.current_y
+                origin_z = self.current_z
+            else:
+                origin_x = self.target_x
+                origin_y = self.target_y
+                origin_z = self.target_z
+
+            waypoints, _ = generate_shape_waypoints(
+                cmd,
+                origin_x=origin_x,
+                origin_y=origin_y,
+                origin_z=float(cmd.get('alt_z', origin_z)),
+            )
+            self._activate_path(
+                waypoints,
+                speed=cmd.get('speed', cmd.get('speed_m_s', self.target_speed)),
+                threshold_m=cmd.get('threshold_m'),
+                loop=cmd.get('loop', False),
+            )
 
         # ── Camera ROI ───────────────────────────────────────────────────
         elif action in ('look_at_gps', 'look_at'):
@@ -242,12 +329,14 @@ class CommandTranslator:
         elif action == 'land':
             self.orbiting = False
             self.square_active = False
+            self.path_active = False
             msg = self._make_vehicle_command(MAV_CMD_NAV_LAND)
             messages.append(('/fmu/in/vehicle_command', msg))
 
         elif action == 'rtl':
             self.orbiting = False
             self.square_active = False
+            self.path_active = False
             msg = self._make_vehicle_command(MAV_CMD_NAV_RETURN_TO_LAUNCH)
             messages.append(('/fmu/in/vehicle_command', msg))
 
@@ -255,6 +344,7 @@ class CommandTranslator:
         elif action == 'hold':
             self.orbiting = False
             self.square_active = False
+            self.path_active = False
 
         return messages
 
@@ -285,6 +375,22 @@ class CommandTranslator:
             target_z = self.square_alt_z
             target_yaw = float('nan')
 
+        elif self.path_active:
+            wp = self.path_waypoints[self.path_wp_index]
+            target_x = wp[0]
+            target_y = wp[1]
+            target_z = wp[2]
+            if self.have_position:
+                dx = target_x - self.current_x
+                dy = target_y - self.current_y
+                if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                    target_yaw = math.atan2(dy, dx)
+            elif self._have_last_setpoint:
+                dx = target_x - self._last_setpoint_x
+                dy = target_y - self._last_setpoint_y
+                if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                    target_yaw = math.atan2(dy, dx)
+
         elif self.orbiting:
             angular_vel = self.orbit_speed / max(self.orbit_radius, 1.0)
             self.orbit_angle += angular_vel * dt
@@ -312,12 +418,81 @@ class CommandTranslator:
 
         return msg
 
+    def _activate_path(
+        self,
+        waypoints: list[tuple[float, float, float]],
+        *,
+        speed: float,
+        threshold_m: float | None,
+        loop: bool,
+    ):
+        """Activate the shared waypoint-path follower state."""
+        self.path_speed = self._cap_speed(speed)
+        self.path_loop = bool(loop)
+        self.path_waypoints = list(waypoints)
+        self.path_threshold = self._compute_path_threshold(
+            self.path_waypoints,
+            threshold_m,
+        )
+        self.path_wp_index = 0
+        self.path_active = True
+        self.path_sequence_id += 1
+        self.orbiting = False
+        self.square_active = False
+        self.target_x = self.path_waypoints[0][0]
+        self.target_y = self.path_waypoints[0][1]
+        self.target_z = self.path_waypoints[0][2]
+        self.target_yaw = float('nan')
+
     def _cap_speed(self, speed: float) -> float:
         """Clamp requested mission speed to the configured hard cap."""
         speed = max(0.0, float(speed))
         if self.max_speed_m_s > 0.0:
             return min(speed, self.max_speed_m_s)
         return speed
+
+    def _compute_path_threshold(
+        self,
+        waypoints: list[tuple[float, float, float]],
+        requested_threshold_m: float | None,
+    ) -> float:
+        """Choose a waypoint-advance threshold that matches the path density.
+
+        Dense generated shapes like spirals can have sub-meter waypoint spacing.
+        A fixed 1.0 m threshold causes the controller to skip many early points
+        before the vehicle has moved. When the caller does not explicitly set a
+        threshold, derive one from the median segment length instead.
+        """
+        if requested_threshold_m is not None:
+            return max(0.15, float(requested_threshold_m))
+
+        if len(waypoints) < 2:
+            return 0.3
+
+        segment_lengths = []
+        for idx in range(1, len(waypoints)):
+            prev = waypoints[idx - 1]
+            curr = waypoints[idx]
+            segment_lengths.append(
+                math.sqrt(
+                    (curr[0] - prev[0]) ** 2 +
+                    (curr[1] - prev[1]) ** 2 +
+                    (curr[2] - prev[2]) ** 2
+                )
+            )
+
+        segment_lengths = [length for length in segment_lengths if length > 1e-6]
+        if not segment_lengths:
+            return 0.3
+
+        segment_lengths.sort()
+        mid = len(segment_lengths) // 2
+        if len(segment_lengths) % 2 == 1:
+            median_length = segment_lengths[mid]
+        else:
+            median_length = 0.5 * (segment_lengths[mid - 1] + segment_lengths[mid])
+
+        return max(0.15, min(0.75, 0.4 * median_length))
 
     def _limit_translation_speed(
         self,
@@ -332,6 +507,10 @@ class CommandTranslator:
         present a meaningful vertical target to PX4 immediately.
         """
         speed_cap = self.translation_speed_cap_override_m_s
+        if speed_cap <= 0.0 and self.path_active:
+            speed_cap = self.path_speed
+        if speed_cap <= 0.0 and self.square_active:
+            speed_cap = self.square_speed
         if speed_cap <= 0.0:
             speed_cap = self.max_speed_m_s
 
@@ -371,6 +550,41 @@ class CommandTranslator:
         msg.attitude = False
         msg.body_rate = False
         return msg
+
+    def _normalize_path_point(self, point, default_z: float) -> tuple[float, float, float]:
+        """Convert one raw LLM waypoint into a safe absolute NED tuple."""
+        if isinstance(point, dict):
+            x = point.get('x')
+            y = point.get('y')
+            z = point.get('z', default_z)
+        elif isinstance(point, (list, tuple)):
+            if len(point) == 2:
+                x, y = point
+                z = default_z
+            elif len(point) >= 3:
+                x, y, z = point[:3]
+            else:
+                raise ValueError('path waypoint lists must contain at least x and y')
+        else:
+            raise ValueError('path waypoints must be objects or [x, y, z] lists')
+
+        x = float(x)
+        y = float(y)
+        z = -abs(float(z))
+        z = max(-120.0, min(-1.0, z))
+        return (x, y, z)
+
+    def _path_points_differ(
+        self,
+        first: tuple[float, float, float],
+        second: tuple[float, float, float],
+    ) -> bool:
+        """Return True when two path points are meaningfully different."""
+        return (
+            abs(first[0] - second[0]) > 1e-3 or
+            abs(first[1] - second[1]) > 1e-3 or
+            abs(first[2] - second[2]) > 1e-3
+        )
 
     def _arm_and_offboard(self) -> list:
         """Generate messages to arm the drone and switch to OFFBOARD mode."""

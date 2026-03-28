@@ -32,6 +32,8 @@ from px4_msgs.msg import (
 
 from drone_agent.llm_client import LLMClient
 from drone_agent.command_translator import CommandTranslator
+from drone_agent.shape_generator import is_supported_shape_name
+from drone_agent.functiongemma_path_generator import FunctionGemmaPathGenerator
 
 
 class BrainNode(Node):
@@ -44,16 +46,23 @@ class BrainNode(Node):
         self.declare_parameter('max_speed_m_s', 2.0)
         self.declare_parameter('ollama_url', 'http://localhost:11434')
         self.declare_parameter('ollama_model', 'qwen3:4b')
+        self.declare_parameter('enable_custom_shape_fallback', True)
+        self.declare_parameter('custom_shape_model', 'functiongemma')
 
         self.llm_interval = self.get_parameter('llm_interval_sec').value
         offboard_rate = self.get_parameter('offboard_rate_hz').value
         max_speed_m_s = self.get_parameter('max_speed_m_s').value
         ollama_url = self.get_parameter('ollama_url').value
         ollama_model = self.get_parameter('ollama_model').value
+        self.enable_custom_shape_fallback = bool(
+            self.get_parameter('enable_custom_shape_fallback').value
+        )
+        self.custom_shape_model = self.get_parameter('custom_shape_model').value
 
         # Initialize components
         self.llm = LLMClient(model=ollama_model, ollama_url=ollama_url)
         self.translator = CommandTranslator(max_speed_m_s=max_speed_m_s)
+        self.custom_shape_generator = None
 
         # State
         self.current_command = ''
@@ -129,6 +138,7 @@ class BrainNode(Node):
         self.mission_search_timeout_sec = 90.0
         self.mission_approach_timeout_sec = 300.0
         self.mission_approach_stall_timeout_sec = 45.0
+        self.mission_path_timeout_sec = 180.0
         self.mission_last_target_class: str | None = None
 
         # QoS for PX4 topics (best-effort, volatile — matches PX4 uXRCE-DDS)
@@ -315,6 +325,60 @@ class BrainNode(Node):
 
         return None
 
+    def _looks_like_custom_shape_request(self, command: str) -> bool:
+        """Heuristic: whether the prompt is asking for a geometric custom path."""
+        text = command.lower()
+        if any(word in text for word in ('search', 'find', 'approach', 'follow', 'track')):
+            return False
+        shape_markers = (
+            ' shape',
+            'draw ',
+            'outline ',
+            'pattern ',
+            'spiral',
+            'star',
+            'heart',
+            'clover',
+            'crescent',
+            'diamond',
+            'figure eight',
+            'figure-eight',
+            'zigzag',
+            'triangle',
+            'rectangle',
+            'square',
+            'polygon',
+        )
+        return any(marker in text for marker in shape_markers)
+
+    def _custom_shape_size_m(self, cmd: dict) -> float:
+        """Choose a target size for custom generated shapes."""
+        for key in ('size_m', 'width', 'width_m', 'side', 'side_m'):
+            value = cmd.get(key)
+            if value is not None:
+                return max(2.0, float(value))
+        radius = cmd.get('radius', cmd.get('radius_m'))
+        if radius is not None:
+            return max(2.0, float(radius) * 2.0)
+
+        match = re.search(
+            r'(\d+(?:\.\d+)?)\s*(?:m|meter|meters|metre|metres)\b',
+            self.current_command.lower(),
+        )
+        if match:
+            return max(2.0, float(match.group(1)))
+        return 12.0
+
+    def _ensure_custom_shape_generator(self) -> FunctionGemmaPathGenerator:
+        """Create the lazy FunctionGemma wrapper on first use."""
+        if self.custom_shape_generator is None:
+            ollama_url = self.get_parameter('ollama_url').value
+            self.custom_shape_generator = FunctionGemmaPathGenerator(
+                model_name=self.custom_shape_model,
+                ollama_url=ollama_url,
+            )
+        return self.custom_shape_generator
+
     def _strip_duration_phrase(self, command: str) -> str:
         """Remove a trailing 'for N seconds/minutes' phrase from a clause."""
         stripped = re.sub(
@@ -477,12 +541,36 @@ class BrainNode(Node):
             )
 
         pattern_words = ('rectangle', 'square', 'circle', 'orbit')
-        if duration_sec is not None and any(word in text for word in pattern_words):
+        custom_path_words = (
+            'spiral',
+            'triangle',
+            'pentagon',
+            'hexagon',
+            'octagon',
+            'star',
+            'zigzag',
+            'figure eight',
+            'figure-eight',
+            'lemniscate',
+            'diamond',
+            'heart',
+            'wave',
+            'arc',
+        )
+        if duration_sec is not None and any(word in text for word in pattern_words + custom_path_words):
             return self._make_command_step(
                 bare_text,
                 {'type': 'duration', 'seconds': duration_sec},
                 label=f'{bare_text} for {duration_sec:g} seconds',
                 timeout_sec=duration_sec + 10.0,
+            )
+
+        if any(word in text for word in custom_path_words):
+            return self._make_command_step(
+                bare_text,
+                {'type': 'path_complete'},
+                label=bare_text,
+                timeout_sec=self.mission_path_timeout_sec,
             )
 
         return None
@@ -645,6 +733,17 @@ class BrainNode(Node):
                         label=label or str(command_text),
                         timeout_sec=(
                             float(timeout_sec) if timeout_sec is not None else 60.0
+                        ),
+                    ))
+                    continue
+
+                if completion_type == 'path_complete':
+                    steps.append(self._make_command_step(
+                        str(command_text),
+                        {'type': 'path_complete'},
+                        label=label or str(command_text),
+                        timeout_sec=(
+                            float(timeout_sec) if timeout_sec is not None else self.mission_path_timeout_sec
                         ),
                     ))
                     continue
@@ -1030,6 +1129,21 @@ class BrainNode(Node):
                     self._complete_current_mission_step(
                         f'position reached within {tolerance_m:.1f} m'
                     )
+            else:
+                self.mission_step_success_since = 0.0
+            return
+
+        if completion_type == 'path_complete':
+            path_sequence_id = int(step.get('_path_sequence_id', -1))
+            if (
+                path_sequence_id >= 0 and
+                not self.translator.path_active and
+                self.translator.path_completed_sequence_id == path_sequence_id
+            ):
+                if self.mission_step_success_since == 0.0:
+                    self.mission_step_success_since = now
+                elif now - self.mission_step_success_since >= 0.3:
+                    self._complete_current_mission_step('path complete')
             else:
                 self.mission_step_success_since = 0.0
             return
@@ -1663,6 +1777,8 @@ class BrainNode(Node):
             'climb',
             'ascend',
             'descend',
+            'upward',
+            'downward',
             'rise',
             'go up',
             'go down',
@@ -1684,6 +1800,8 @@ class BrainNode(Node):
             return float(self.translator.orbit_alt_z)
         if self.translator.square_active:
             return float(self.translator.square_alt_z)
+        if self.translator.path_active:
+            return float(self.translator.target_z)
         return float(self.translator.target_z)
 
     def _preserve_altitude_if_unspecified(self, cmd: dict):
@@ -1702,6 +1820,30 @@ class BrainNode(Node):
         elif action in ('square_survey', 'square'):
             cmd.pop('alt', None)
             cmd['alt_z'] = hold_alt_z
+        elif action == 'shape_path':
+            cmd['alt_z'] = hold_alt_z
+            cmd['climb_m'] = 0.0
+        elif action == 'path':
+            points = cmd.get('points')
+            if isinstance(points, list):
+                adjusted_points = []
+                for point in points:
+                    if isinstance(point, dict):
+                        adjusted = dict(point)
+                        adjusted['z'] = hold_alt_z
+                        adjusted_points.append(adjusted)
+                    elif isinstance(point, (list, tuple)):
+                        if len(point) >= 2:
+                            adjusted_points.append([point[0], point[1], hold_alt_z])
+                        else:
+                            adjusted_points.append(point)
+                    else:
+                        adjusted_points.append(point)
+                cmd['points'] = adjusted_points
+            elif str(cmd.get('generator', '')).lower() == 'functiongemma':
+                cmd['alt_z'] = hold_alt_z
+            else:
+                return
         elif action == 'goto':
             cmd['alt'] = abs(hold_alt_z)
         else:
@@ -1716,6 +1858,7 @@ class BrainNode(Node):
         """Stop active patterns and hold the current measured pose while replanning."""
         self.translator.orbiting = False
         self.translator.square_active = False
+        self.translator.path_active = False
         self.search_target = None
         if clear_follow:
             self.visual_follow_active = False
@@ -1792,6 +1935,63 @@ class BrainNode(Node):
             f'at current XY, arming_step={not self.armed}'
         )
         return True
+
+    def _resolve_custom_shape_path_if_requested(self, cmd: dict) -> dict:
+        """Expand unsupported custom shapes into explicit path waypoints via FunctionGemma."""
+        if cmd.get('action') != 'path':
+            return cmd
+        if not self.enable_custom_shape_fallback:
+            return cmd
+
+        generator_name = str(cmd.get('generator', '')).lower()
+        use_custom_generator = generator_name == 'functiongemma'
+        if not use_custom_generator and self._looks_like_custom_shape_request(self.current_command):
+            shape_name = str(cmd.get('shape', '')).strip().lower()
+            use_custom_generator = not is_supported_shape_name(shape_name)
+
+        if not use_custom_generator:
+            return cmd
+
+        prompt = str(cmd.get('shape_prompt') or self.current_command).strip()
+        if not prompt:
+            return cmd
+
+        if self.odometry:
+            origin_x = float(self.odometry.position[0])
+            origin_y = float(self.odometry.position[1])
+        else:
+            origin_x = float(self.translator.target_x)
+            origin_y = float(self.translator.target_y)
+        origin_z = float(cmd.get('alt_z', self._current_target_altitude_z()))
+        current_yaw = self._current_yaw_rad()
+        rotation_rad = 0.0 if math.isnan(current_yaw) else current_yaw
+
+        generator = self._ensure_custom_shape_generator()
+        waypoints, shape_spec = generator.generate_waypoints(
+            prompt,
+            origin_x=origin_x,
+            origin_y=origin_y,
+            origin_z=origin_z,
+            size_m=self._custom_shape_size_m(cmd),
+            closed=bool(cmd.get('closed', True)),
+            point_count=int(cmd.get('point_count', 120)),
+            rotation_rad=rotation_rad,
+        )
+
+        resolved = dict(cmd)
+        resolved['points'] = [[x, y, z] for x, y, z in waypoints]
+        resolved['speed'] = float(cmd.get('speed', self.translator.target_speed))
+        resolved['closed'] = bool(cmd.get('closed', True))
+        resolved['loop'] = bool(cmd.get('loop', False))
+        resolved['generator'] = 'functiongemma'
+        resolved['_functiongemma_family'] = str(shape_spec.get('family', 'unknown'))
+        resolved['_functiongemma_point_count'] = int(shape_spec.get('points', len(waypoints)))
+        self.get_logger().info(
+            f'FunctionGemma fallback selected family="{resolved["_functiongemma_family"]}" '
+            f'and generated {len(waypoints)} waypoints '
+            f'for unsupported custom shape prompt "{prompt}"'
+        )
+        return resolved
 
     # ─── Core loops ────────────────────────────────────────────────────
 
@@ -2046,6 +2246,7 @@ class BrainNode(Node):
 
             action = cmd.get('action')
             self._preserve_altitude_if_unspecified(cmd)
+            cmd = self._resolve_custom_shape_path_if_requested(cmd)
             action = cmd.get('action')
 
             # Orbit with a search goal: extract the YOLO class to watch for
@@ -2064,6 +2265,28 @@ class BrainNode(Node):
                     )
                 else:
                     self.get_logger().info('Pure loiter orbit (no search target)')
+            elif action == 'path':
+                self.search_target = None
+                point_count = len(cmd.get('points', [])) if isinstance(cmd.get('points'), list) else 0
+                if cmd.get('generator') == 'functiongemma':
+                    self.get_logger().info(
+                        f'FunctionGemma custom shape path: {point_count} points'
+                    )
+                else:
+                    self.get_logger().info(
+                        f'Custom waypoint path: {point_count} points'
+                    )
+            elif action == 'shape_path':
+                self.search_target = None
+                if 'reference_yaw_rad' not in cmd:
+                    current_yaw = self._current_yaw_rad()
+                    if not math.isnan(current_yaw):
+                        cmd['reference_yaw_rad'] = current_yaw
+                self.get_logger().info(
+                    f'Deterministic shape path: shape={cmd.get("shape")} '
+                    f'radius={cmd.get("radius", cmd.get("radius_m", "n/a"))} '
+                    f'speed={cmd.get("speed", cmd.get("speed_m_s", "n/a"))}'
+                )
 
             # Hold always freezes the current measured position.
             elif action == 'hold':
@@ -2078,6 +2301,7 @@ class BrainNode(Node):
                 f'z={self.translator.target_z:.1f} | '
                 f'Orbiting: {self.translator.orbiting} | '
                 f'Square: {self.translator.square_active} | '
+                f'Path: {self.translator.path_active} | '
                 f'Extra PX4 msgs: {len(extra_msgs)}'
             )
             self.get_logger().info('=' * 60)
@@ -2098,6 +2322,15 @@ class BrainNode(Node):
                     self.get_logger().info(
                         f'Mission duration step started: {duration_sec:g} second timer armed'
                     )
+
+            if (
+                self.mission_active and
+                self.mission_current_step is not None and
+                str(self.mission_current_step.get('command', '')).strip() == self.current_command.strip() and
+                self.mission_current_step.get('completion', {}).get('type') == 'path_complete' and
+                action in ('path', 'shape_path')
+            ):
+                self.mission_current_step['_path_sequence_id'] = self.translator.path_sequence_id
 
             self._publish_vehicle_commands(extra_msgs)
 

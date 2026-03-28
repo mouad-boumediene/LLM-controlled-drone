@@ -60,6 +60,27 @@ orbit             Continuous circular loiter around a NED centre (runs at 10 Hz)
 square_survey     Fly a square survey pattern centred on current NED position.
   {"action": "square_survey", "side": <m>, "alt_z": <m>, "speed": <m/s>}
 
+shape_path        Fly a deterministic named shape generated in code.
+                  Use this ONLY for these built-in shapes:
+                  circle, square, rectangle, triangle, polygon, star,
+                  figure_eight, zigzag, spiral, heart.
+                  The controller generates the actual waypoints from these parameters.
+                  In NED, "upward / climb / ascend" means z becomes MORE NEGATIVE.
+                  "downward / descend" means z becomes LESS NEGATIVE.
+  {"action": "shape_path", "shape": "<name>", "radius": <m>, "width": <m>, "height": <m>, "side": <m>, "sides": <int>, "turns": <count>, "climb_m": <m>, "forward_m": <m>, "amplitude_m": <m>, "point_count": <int>, "speed": <m/s>, "closed": <bool>, "loop": <bool>}
+
+path              Fly an arbitrary finite waypoint path in absolute NED coordinates.
+                  Use this only when the user explicitly provides or implies custom
+                  free-form waypoints rather than a supported built-in shape.
+                  For unsupported named shapes such as clover, arrow, crescent,
+                  letters, logos, or any other custom outline, output a path
+                  request for the lightweight FunctionGemma fallback generator
+                  instead of guessing bad waypoints yourself.
+  Explicit waypoint form:
+  {"action": "path", "points": [[<x>, <y>, <z>], ...], "speed": <m/s>, "closed": <bool>, "loop": <bool>}
+  FunctionGemma custom-shape form:
+  {"action": "path", "generator": "functiongemma", "shape_prompt": "<original custom shape request>", "size_m": <m>, "point_count": <int>, "speed": <m/s>, "closed": <bool>, "loop": <bool>}
+
 set_heading       Rotate to compass bearing without translating (0=North, 90=East).
   {"action": "set_heading", "heading_deg": <0-360>}
 
@@ -91,6 +112,19 @@ DECISION RULES
 - "Find / look for / search for <object>" → orbit with target_class = YOLO class name.
   Common YOLO class names: "person", "car", "truck", "motorcycle", "bicycle",
                             "bus", "dog", "cat", "boat", "airplane".
+- Prefer orbit for simple circles and loitering.
+- Prefer square_survey for simple square/box patterns.
+- Use shape_path only for supported built-in shapes: circle, square, rectangle,
+  triangle, polygon, star, figure_eight, zigzag, spiral, heart.
+- If the requested shape is NOT in that list, use path with
+  `"generator": "functiongemma"` and preserve the original shape request in
+  `"shape_prompt"`.
+- Do NOT approximate unsupported named shapes with a polygon, circle, or other
+  different built-in shape unless the user explicitly asks for an approximation.
+- Use raw path only for genuinely free-form routes or explicit waypoint-style requests.
+- For shape_path, choose sensible dimensions if the user does not specify them:
+  usually 8-20 metres, not tiny 1-metre shapes.
+- If the user did not ask to change altitude, keep the shape at the current altitude.
 - "Stop / cancel / abort / wait / freeze" → hold.
 - Default orbit radius: 20 m. Default speed: 5 m/s.
 - If intent is unclear or mission is done → hold.
@@ -120,6 +154,10 @@ Return JSON only in this exact shape:
     {
       "command":"fly in a rectangle",
       "completion":{"type":"duration","seconds":60}
+    },
+    {
+      "command":"fly an upward spiral",
+      "completion":{"type":"path_complete"}
     },
     {
       "command":"takeoff",
@@ -154,10 +192,13 @@ Rules:
   - airborne
   - heading_reached
   - position_reached
+  - path_complete
   - target_found
   - approach_complete
 - For heading-only steps like "face east" or "set heading to 90 degrees", use "heading_reached", not duration 0.
 - For one-shot movement steps like "fly forward 10 meters" or "go 20 meters north", use "position_reached", not duration 0.
+- For custom finite shapes like spirals, triangles, zigzags, figure-eights, stars, and other arbitrary
+  routes, use "path_complete".
 - target_class must be one of: person, car, truck, bus, bicycle, motorcycle, dog, cat, boat, airplane.
 - Use "takeoff" only when the user explicitly wants takeoff as a separate step. If the next step already sets altitude, you may still keep "takeoff" as its own step with completion type "airborne".
 - Do not include explanations or markdown.

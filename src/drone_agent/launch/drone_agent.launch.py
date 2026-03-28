@@ -4,6 +4,7 @@ Launches:
 1. Optional ros_gz_bridge camera bridge
 2. yolo_detector — runs YOLOv8 on camera images
 3. brain_node — orchestrates LLM + PX4 control
+4. trail_node — publishes an RViz path trail from PX4 odometry
 
 Prerequisites (run in separate terminals):
 - PX4 SITL: cd PX4-Autopilot && make px4_sitl gz_x500_mono_cam
@@ -53,6 +54,18 @@ def generate_launch_description():
             'max_speed_m_s', default_value='2.0',
             description='Hard translational speed cap in metres per second (0 disables cap)',
         ),
+        DeclareLaunchArgument(
+            'enable_custom_shape_fallback', default_value='true',
+            description='Use a lightweight FunctionGemma fallback for unsupported custom shapes',
+        ),
+        DeclareLaunchArgument(
+            'custom_shape_model', default_value='functiongemma',
+            description='Ollama model used for unsupported custom shape prompts',
+        ),
+        DeclareLaunchArgument(
+            'start_trail_node', default_value='true',
+            description='Publish an RViz-friendly nav_msgs/Path trail from PX4 odometry',
+        ),
 
         # --- Gazebo camera bridge ---
         ExecuteProcess(
@@ -93,6 +106,25 @@ def generate_launch_description():
                 'ollama_model': LaunchConfiguration('ollama_model'),
                 'offboard_rate_hz': LaunchConfiguration('offboard_rate_hz'),
                 'max_speed_m_s': LaunchConfiguration('max_speed_m_s'),
+                'enable_custom_shape_fallback': LaunchConfiguration('enable_custom_shape_fallback'),
+                'custom_shape_model': LaunchConfiguration('custom_shape_model'),
+            }],
+        ),
+
+        # --- RViz trail node ---
+        Node(
+            condition=IfCondition(LaunchConfiguration('start_trail_node')),
+            package='drone_agent',
+            executable='trail_node',
+            name='trail_node',
+            output='screen',
+            parameters=[{
+                'odometry_topic': '/fmu/out/vehicle_odometry',
+                'path_topic': '/drone/path',
+                'frame_id': 'map',
+                'max_points': 2000,
+                'min_point_spacing_m': 0.15,
+                'jump_reset_distance_m': 20.0,
             }],
         ),
     ])

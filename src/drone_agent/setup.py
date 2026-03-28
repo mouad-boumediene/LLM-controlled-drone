@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'brain_node = drone_agent.brain_node:main',
             'yolo_detector = drone_agent.yolo_detector:main',
+            'trail_node = drone_agent.trail_node:main',
         ],
     },
 )
