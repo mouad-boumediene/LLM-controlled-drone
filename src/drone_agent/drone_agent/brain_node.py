@@ -160,14 +160,20 @@ class BrainNode(Node):
             SensorGps, '/fmu/out/vehicle_gps_position',
             self._gps_cb, px4_qos,
         )
-        self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status',
-            self._status_cb, px4_qos,
+        vehicle_status_topics = [
+            '/fmu/out/vehicle_status',
+            '/fmu/out/vehicle_status_v1',
+        ]
+        versioned_vehicle_status_topic = (
+            f'/fmu/out/vehicle_status_v{VehicleStatus.MESSAGE_VERSION}'
         )
-        self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status_v1',
-            self._status_cb, px4_qos,
-        )
+        if versioned_vehicle_status_topic not in vehicle_status_topics:
+            vehicle_status_topics.append(versioned_vehicle_status_topic)
+        for topic in vehicle_status_topics:
+            self.create_subscription(
+                VehicleStatus, topic,
+                self._status_cb, px4_qos,
+            )
         self.create_subscription(
             BatteryStatus, '/fmu/out/battery_status',
             self._battery_cb, px4_qos,
@@ -213,6 +219,9 @@ class BrainNode(Node):
         )
         self.get_logger().info(
             f'Brain node started. Waiting for user command on /user_command ...{speed_cap_text}'
+        )
+        self.get_logger().info(
+            'Vehicle status subscriptions: ' + ', '.join(vehicle_status_topics)
         )
 
     def _target_aliases(self) -> dict[str, tuple[str, ...]]:
@@ -1518,12 +1527,14 @@ class BrainNode(Node):
                 f'{self.translator.target_z:.1f})'
             )
         # Fallback: if vehicle_status is not arriving, infer "armed-ish"
-        # from whether the vehicle is clearly airborne. This must reset back
-        # to False after landing, otherwise later takeoff prompts are misread.
-        if self.vehicle_status is None and abs(float(pos[2])) > 2.0:
-            self.armed = True
-        elif self.vehicle_status is None:
-            self.armed = False
+        # from whether the vehicle is clearly airborne, with hysteresis so
+        # the state does not flap near the ground or at an exact 2.0 m hover.
+        if self.vehicle_status is None:
+            altitude_m = abs(float(pos[2]))
+            if altitude_m >= 0.5:
+                self.armed = True
+            elif altitude_m <= 0.2:
+                self.armed = False
 
     def _gps_cb(self, msg: SensorGps):
         self.gps = msg
